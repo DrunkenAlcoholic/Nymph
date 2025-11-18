@@ -1,11 +1,20 @@
 import std/[os, terminal, math, strutils, strformat, dirs, random, sets, base64, posix]
 
 
+type
+  # Holds raw PNG bytes and dimensions so we can size the Kitty placement.
+  LogoData = object
+    bytes: string
+    width: int
+    height: int
+
 const
   DefaultLogoName = "generic"
   sourceLogoDir = parentDir(currentSourcePath()) / "logos"
   projectLogoDir = parentDir(parentDir(currentSourcePath())) / "logos"
-  LogoPixelSize = 200
+  MaxLogoWidth = 200           # Clamp rendered PNG width so stats have room.
+  ## Column where the stats should start; bump this if you raise MaxLogoWidth.
+  StatsOffset = 22
   kittyChunkSize = 4096
   AsciiFallbackLogo = """  
       .---.   
@@ -63,6 +72,7 @@ const
 
 
 proc normalizeDir(path: string): string =
+  ## Expand ~, remove duplicates, and produce an absolute path.
   if path.len == 0:
     return ""
 
@@ -88,6 +98,7 @@ proc normalizeDir(path: string): string =
 
 
 proc getLogoSearchDirs(): seq[string] =
+  ## Assemble all directories we search for logos (env/app/source/project).
   var dirs = @[sourceLogoDir, projectLogoDir]
   let envDir = getEnv("NYMPH_LOGO_DIR")
   if envDir.len > 0: dirs.add envDir
@@ -105,6 +116,7 @@ proc getLogoSearchDirs(): seq[string] =
 
 
 proc locateLogoFile(name, ext: string): string =
+  ## Return the first logo file that matches the provided name/extension.
   let fileName = name.toLowerAscii() & ext
   for dir in getLogoSearchDirs():
     let path = dir / fileName
@@ -112,13 +124,29 @@ proc locateLogoFile(name, ext: string): string =
   ""
 
 
-proc loadLogo(name: string): string =
+proc parsePngDims(data: string): (int, int) =
+  ## Read the PNG IHDR chunk to extract width/height.
+  if data.len < 24: return (0, 0)
+  if not data.startsWith("\x89PNG\x0d\x0a\x1a\x0a"): return (0, 0)
+  let w = (ord(data[16]) shl 24) or (ord(data[17]) shl 16) or (ord(data[18]) shl 8) or ord(data[19])
+  let h = (ord(data[20]) shl 24) or (ord(data[21]) shl 16) or (ord(data[22]) shl 8) or ord(data[23])
+  (w, h)
+
+
+proc loadLogo(name: string): LogoData =
+  ## Load PNG bytes and dimensions for the given logo name.
   let path = locateLogoFile(name, ".png")
-  if path.len == 0: return ""
+  if path.len == 0: return
   try:
-    readFile(path)
+    let raw = readFile(path)
+    if raw.len == 0: return
+    let (w, h) = parsePngDims(raw)
+    if w <= 0 or h <= 0: return
+    result.bytes = raw
+    result.width = w
+    result.height = h
   except IOError:
-    ""
+    discard
 
 
 when defined(posix):
@@ -133,6 +161,7 @@ when defined(posix):
 
 
 proc getWindowPixels(): tuple[width, height: int] =
+  ## Query the terminal window size in pixels (falls back to 0s).
   when defined(posix):
     var ws: TermWinSize
     if ioctl(STDOUT_FILENO, ioctlWinSize, addr ws) == 0:
@@ -141,6 +170,7 @@ proc getWindowPixels(): tuple[width, height: int] =
 
 
 proc getCellMetrics(): tuple[cellWidth, cellHeight: float] =
+  ## Derive approximate cell width/height in pixels from window metrics.
   let cols = terminalWidth()
   let rows = terminalHeight()
   let winPixels = getWindowPixels()
@@ -154,6 +184,7 @@ proc getCellMetrics(): tuple[cellWidth, cellHeight: float] =
 
 
 proc supportsKittyGraphics(): bool {.inline.} =
+  ## Detect whether we’re running inside Kitty.
   let term = getEnv("TERM").toLowerAscii()
   if term.contains("kitty"): return true
   if getEnv("KITTY_WINDOW_ID").len > 0: return true
@@ -161,7 +192,8 @@ proc supportsKittyGraphics(): bool {.inline.} =
   false
 
 
-proc displayKittyImage(logoBytes: string; columns, rows: int) =
+proc displayKittyGraphics(logoBytes: string; columns, rows: int) =
+  ## Stream the PNG bytes via Kitty’s graphics protocol.
   if logoBytes.len == 0: return
   let encoded = encode(logoBytes)
   var offset = 0
@@ -192,6 +224,7 @@ proc displayKittyImage(logoBytes: string; columns, rows: int) =
 
 
 proc collectAvailableLogos(): seq[string] =
+  ## Enumerate unique logo names detected across all search paths.
   var seen = initHashSet[string]()
   for dir in getLogoSearchDirs():
     try:
@@ -208,12 +241,14 @@ proc collectAvailableLogos(): seq[string] =
 
 
 proc sanitizeLogoName(name: string): string =
+  ## Strip non-alphanumeric characters before matching names.
   for ch in name.toLowerAscii():
     if ch.isAlphaNumeric:
       result.add(ch)
 
 
 proc findBestLogoMatch(candidates: seq[string]): string =
+  ## Pick the first candidate that matches an available logo.
   var available = collectAvailableLogos()
   if available.len == 0:
     return ""
@@ -252,6 +287,7 @@ proc findBestLogoMatch(candidates: seq[string]): string =
 
 
 proc parseLogoOverride(): string =
+  ## Parse --logo CLI arguments (supports “--logo foo” and “--logo=foo”).
   let params = commandLineParams()
   var i = 0
   while i < params.len:
@@ -266,6 +302,7 @@ proc parseLogoOverride(): string =
 
 
 proc detectLogoName(): string =
+  ## Build a list of candidate names from CLI, env vars, and os-release.
   var candidates: seq[string] = @[]
 
   let cliLogo = parseLogoOverride()
@@ -304,6 +341,7 @@ proc detectLogoName(): string =
 
 
 proc getOS(): string {.inline.} =
+  ## Return PRETTY_NAME from /etc/os-release or fall back to NAME.
   var distroname = ""
   if fileExists(osReleasePath):
     for line in lines(osReleasePath):
@@ -319,6 +357,7 @@ proc getOS(): string {.inline.} =
 
 
 proc getKernel(): string {.inline.} =
+  ## Read kernel version from /proc/version (fallback to last token).
   if fileExists(versionFile):
     let tokens = readFile(versionFile).splitWhitespace()
     if tokens.len >= 3:
@@ -329,6 +368,7 @@ proc getKernel(): string {.inline.} =
 
 
 proc getPackages(): int {.inline.} =
+  ## Naive package-count heuristic: checks common package manager dirs.
   let packageDirs = [
     "/var/lib/pacman/local",       # Pacman (Arch, Manjaro)
     "/var/lib/eopkg/package",      # Eopkg (Solus)
@@ -370,6 +410,7 @@ proc getPackages(): int {.inline.} =
 
 
 proc getShell(): string {.inline.} =
+  ## Resolve the current shell from SHELL/$USER’s /etc/passwd entry.
   let shellEnv = getEnv("SHELL")
   if shellEnv.len > 0:
     let basename = shellEnv.splitPath().tail
@@ -391,6 +432,7 @@ proc getShell(): string {.inline.} =
 
 
 proc getUptime(): string =
+  ## Format /proc/uptime into “X days, HH:MM:SS”.
   var uptime: float
   try:
     uptime = parseFloat(readFile(uptimeFile).split()[0])
@@ -408,6 +450,7 @@ proc getUptime(): string =
 
 
 proc getMemory(): string =
+  ## Compute used memory using the htop formula (total - free/buffers/cached).
   var 
     memTotal, memFree, buffers, cached, shmem, sreclaimable: int
   
@@ -433,6 +476,7 @@ proc getMemory(): string =
 
   
 proc getDE(): string =
+  ## Try common desktop environment variables, fallback to WM name.
   result = getEnv("XDG_CURRENT_DESKTOP")
   if result == "":
     result = getEnv("DESKTOP_SESSION")
@@ -447,28 +491,39 @@ proc getDE(): string =
     
 
 proc getColours(): string {.inline.} =
+  ## Print a sequence of colored icons to mimic fetch “color blocks”.
   let randIcon = icons[rand(icons.high)]
   fmt"{col.rosewater}{randIcon} {col.mauve}{randIcon} {col.pink}{randIcon} {col.maroon}{randIcon} {col.sky}{randIcon} {col.green}{randIcon} {col.lavender}{randIcon} "
 
-const
-  outputFormat = [
-    (22, 1, fmt"{col.rosewater}{icon.os}  {col.yellow}{col.bold}OS:{col.reset}      $#"),
-    (22, 2, fmt"{col.pink}{icon.kernel}  {col.yellow}{col.bold}Kernel:{col.reset}  $#"),
-    (22, 3, fmt"{col.mauve}{icon.desktop}  {col.yellow}{col.bold}DE/WM:{col.reset}   $#"),
-    (22, 4, fmt"{col.maroon}{icon.pkgs}  {col.yellow}{col.bold}Pkgs:{col.reset}    $#"),
-    (22, 5, fmt"{col.sky}{icon.shell}  {col.yellow}{col.bold}Shell:{col.reset}   $#"),
-    (22, 6, fmt"{col.green}{icon.uptime}  {col.yellow}{col.bold}Uptime:{col.reset}  $#"),
-    (22, 7, fmt"{col.lavender}{icon.memory}  {col.yellow}{col.bold}Memory:{col.reset}  $#"),
-    (30, 8, fmt"$#{col.reset}")
-  ]
+type StatEntry = object
+  ## Describes where to print each stat line and how to obtain its value.
+  col: int
+  row: int
+  formatter: string
+  getter: proc(): string {.closure.}
+
+const statsEntries: array[8, StatEntry] = [
+  StatEntry(col: StatsOffset, row: 1, formatter: fmt"{col.rosewater}{icon.os}  {col.yellow}{col.bold}OS:{col.reset}      $#", getter: proc(): string = getOS()),
+  StatEntry(col: StatsOffset, row: 2, formatter: fmt"{col.pink}{icon.kernel}  {col.yellow}{col.bold}Kernel:{col.reset}  $#", getter: proc(): string = getKernel()),
+  StatEntry(col: StatsOffset, row: 3, formatter: fmt"{col.mauve}{icon.desktop}  {col.yellow}{col.bold}DE/WM:{col.reset}   $#", getter: proc(): string = getDE()),
+  StatEntry(col: StatsOffset, row: 4, formatter: fmt"{col.maroon}{icon.pkgs}  {col.yellow}{col.bold}Pkgs:{col.reset}    $#", getter: proc(): string = $getPackages()),
+  StatEntry(col: StatsOffset, row: 5, formatter: fmt"{col.sky}{icon.shell}  {col.yellow}{col.bold}Shell:{col.reset}   $#", getter: proc(): string = getShell()),
+  StatEntry(col: StatsOffset, row: 6, formatter: fmt"{col.green}{icon.uptime}  {col.yellow}{col.bold}Uptime:{col.reset}  $#", getter: proc(): string = getUptime()),
+  StatEntry(col: StatsOffset, row: 7, formatter: fmt"{col.lavender}{icon.memory}  {col.yellow}{col.bold}Memory:{col.reset}  $#", getter: proc(): string = getMemory()),
+  StatEntry(col: StatsOffset, row: 8, formatter: fmt"       $#{col.reset}", getter: proc(): string = getColours())
+]
 
 
-proc computeLogoCells(): tuple[cols, rows: int] =
+proc computeLogoCells(logo: LogoData): tuple[cols, rows: int] =
+  ## Convert PNG dimensions to terminal cell counts while preserving aspect ratio.
   let metrics = getCellMetrics()
   let cw = max(1.0, metrics.cellWidth)
   let ch = max(1.0, metrics.cellHeight)
-  let cols = max(1, int(ceil(LogoPixelSize.float / cw)))
-  let rows = max(1, int(ceil(LogoPixelSize.float / ch)))
+  let targetWidth = min(logo.width, MaxLogoWidth)
+  let scale = targetWidth.float / max(logo.width.float, 1.0)
+  let targetHeight = logo.height.float * scale
+  let cols = max(1, int(ceil(targetWidth.float / cw)))
+  let rows = max(1, int(ceil(targetHeight / ch)))
   (cols, rows)
 
 
@@ -476,33 +531,24 @@ when isMainModule:
   randomize()
   stdout.eraseScreen()
 
+  # Resolve logo name and load PNG bytes/dimensions if possible.
   let kittyCapable = supportsKittyGraphics()
   let detectedLogoName = detectLogoName()
   var logo = loadLogo(detectedLogoName)
-  if logo.len == 0:
+  if logo.bytes.len == 0:
     logo = loadLogo(DefaultLogoName)
 
-  let values = [
-    getOS(),
-    getKernel(),
-    getDE(),
-    $getPackages(),
-    getShell(),
-    getUptime(),
-    getMemory(),
-    getColours()
-  ]
-
-  if kittyCapable and logo.len > 0:
+  if kittyCapable and logo.bytes.len > 0:
     stdout.setCursorPos(1, 1)
-    let placement = computeLogoCells()
-    displayKittyImage(logo, placement.cols, placement.rows)
+    let placement = computeLogoCells(logo)
+    displayKittyGraphics(logo.bytes, placement.cols, placement.rows)
   else:
     stdout.setCursorPos(1, 1)
     stdout.write(AsciiFallbackLogo)
 
-  for i, (y, x, format) in outputFormat.pairs:
-    stdout.setCursorPos(y, x)
-    stdout.write(format % values[i])
+  # Render stats block next to the logo.
+  for entry in statsEntries:
+    stdout.setCursorPos(entry.col, entry.row)
+    stdout.write(entry.formatter % entry.getter())
   stdout.write("\n\n")
   stdout.flushFile()

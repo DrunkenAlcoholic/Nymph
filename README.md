@@ -35,6 +35,7 @@ integrate it into shell startup scripts or keybindings as you like.
   3. Source `logos/`
   4. Project `logos/`
 - **Requirements**: PNG files render best at 128×128 px. Nymph uses the Kitty graphics protocol; PNG logos only appear in Kitty terminals.
+- **Scaling**: PNG logos are self-scaling up to 128×128 px.
 - **Fallback**: If no PNG is found or Kitty graphics protocol aren’t available, Nymph displays the built-in ASCII “generic” logo.
 
 ## License
