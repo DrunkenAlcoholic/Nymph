@@ -1,10 +1,23 @@
-import std/[os, terminal, math, strutils, strformat, dirs, random, sets]
+import std/[os, terminal, math, strutils, strformat, dirs, random, sets, base64, posix]
 
 
 const
   DefaultLogoName = "generic"
   sourceLogoDir = parentDir(currentSourcePath()) / "logos"
   projectLogoDir = parentDir(parentDir(currentSourcePath())) / "logos"
+  LogoPixelSize = 200
+  kittyChunkSize = 4096
+  AsciiFallbackLogo = """  
+      .---.   
+      /     \    
+      \.@-@./    
+      /`\_/`\    
+     //  _  \\    
+    | \     )|_   
+   /`\_`>  <_/ \_  
+   \__/''---''\__/ 
+
+""" & "\n"
 
   icons = static: [" ", " ", " ", " ", "󰯉 ", " ", " ", "󰞦 ", "󰄊 ", "󱖿 ", " ", "󰌽 ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", "󰢚 ", "󰆚 ", "󰩃 ", "󱔐 ", "󱕘 ", "󱜿 ", "󰻀 ", "󰳆 ", "󱗂 "]
 
@@ -74,49 +87,108 @@ proc normalizeDir(path: string): string =
     absolutePath(expanded)
 
 
-
 proc getLogoSearchDirs(): seq[string] =
-  var dirs: seq[string] = @[]
-
+  var dirs = @[sourceLogoDir, projectLogoDir]
   let envDir = getEnv("NYMPH_LOGO_DIR")
-  if envDir.len > 0:
-    dirs.add envDir
-
+  if envDir.len > 0: dirs.add envDir
   let appDir = getAppDir()
   if appDir.len > 0:
     dirs.add appDir / "logos"
     dirs.add appDir / "../share/nymph/logos"
 
-  dirs.add sourceLogoDir
-  dirs.add projectLogoDir
-
   var seen = initHashSet[string]()
   for dir in dirs:
     let norm = normalizeDir(dir)
-    if norm.len == 0: continue
-    if not seen.contains(norm):
+    if norm.len > 0 and not seen.contains(norm):
       seen.incl(norm)
       result.add norm
 
 
-proc locateLogoFile(name: string): string =
-  let fileName = name.toLowerAscii() & ".kitty"
+proc locateLogoFile(name, ext: string): string =
+  let fileName = name.toLowerAscii() & ext
   for dir in getLogoSearchDirs():
     let path = dir / fileName
-    if fileExists(path):
-      return path
+    if fileExists(path): return path
   ""
 
 
 proc loadLogo(name: string): string =
-  let path = locateLogoFile(name)
+  let path = locateLogoFile(name, ".png")
   if path.len == 0: return ""
   try:
-    let raw = readFile(path)
-    if raw.len == 0: return ""
-    raw
+    readFile(path)
   except IOError:
     ""
+
+
+when defined(posix):
+  type
+    TermWinSize = object
+      ws_row: cushort
+      ws_col: cushort
+      ws_xpixel: cushort
+      ws_ypixel: cushort
+
+  const ioctlWinSize = culong(0x5413)
+
+
+proc getWindowPixels(): tuple[width, height: int] =
+  when defined(posix):
+    var ws: TermWinSize
+    if ioctl(STDOUT_FILENO, ioctlWinSize, addr ws) == 0:
+      return (int(ws.ws_xpixel), int(ws.ws_ypixel))
+  (0, 0)
+
+
+proc getCellMetrics(): tuple[cellWidth, cellHeight: float] =
+  let cols = terminalWidth()
+  let rows = terminalHeight()
+  let winPixels = getWindowPixels()
+  var cellWidth = 8.0
+  var cellHeight = 16.0
+  if winPixels.width > 0 and cols > 0:
+    cellWidth = winPixels.width.float / cols.float
+  if winPixels.height > 0 and rows > 0:
+    cellHeight = winPixels.height.float / rows.float
+  (cellWidth, cellHeight)
+
+
+proc supportsKittyGraphics(): bool {.inline.} =
+  let term = getEnv("TERM").toLowerAscii()
+  if term.contains("kitty"): return true
+  if getEnv("KITTY_WINDOW_ID").len > 0: return true
+  if getEnv("TERM_PROGRAM").toLowerAscii() == "kitty": return true
+  false
+
+
+proc displayKittyImage(logoBytes: string; columns, rows: int) =
+  if logoBytes.len == 0: return
+  let encoded = encode(logoBytes)
+  var offset = 0
+  var firstChunk = true
+  while offset < encoded.len:
+    let chunkEnd = min(offset + kittyChunkSize, encoded.len)
+    let chunk = encoded[offset ..< chunkEnd]
+    var controlParts: seq[string] = @[]
+    if firstChunk:
+      controlParts.add("a=T")
+      controlParts.add("f=100")
+      controlParts.add("t=d")
+      controlParts.add("q=2")
+      controlParts.add("C=1")
+      if columns > 0: controlParts.add("c=" & $columns)
+      if rows > 0: controlParts.add("r=" & $rows)
+    if chunkEnd < encoded.len:
+      controlParts.add("m=1")
+    stdout.write("\x1b_G")
+    if controlParts.len > 0:
+      stdout.write(controlParts.join(","))
+    if chunk.len > 0:
+      stdout.write(";")
+      stdout.write(chunk)
+    stdout.write("\x1b\\")
+    offset = chunkEnd
+    firstChunk = false
 
 
 proc collectAvailableLogos(): seq[string] =
@@ -124,11 +196,13 @@ proc collectAvailableLogos(): seq[string] =
   for dir in getLogoSearchDirs():
     try:
       for kind, path in walkDir(dir):
-        if kind == pcFile and path.endsWith(".kitty"):
+        if kind != pcFile: continue
+        let ext = path.splitFile.ext.toLowerAscii()
+        if ext == ".png":
           let name = path.splitFile.name.toLowerAscii()
           if not seen.contains(name):
             seen.incl(name)
-            result.add(name)
+            result.add name
     except OSError:
       discard
 
@@ -231,7 +305,6 @@ proc detectLogoName(): string =
 
 proc getOS(): string {.inline.} =
   var distroname = ""
-  
   if fileExists(osReleasePath):
     for line in lines(osReleasePath):
       if line.startsWith("PRETTY_NAME="):
@@ -256,8 +329,6 @@ proc getKernel(): string {.inline.} =
 
 
 proc getPackages(): int {.inline.} =
-  ## Get installed package count
-  # Define directories to check for different package managers that use directories
   let packageDirs = [
     "/var/lib/pacman/local",       # Pacman (Arch, Manjaro)
     "/var/lib/eopkg/package",      # Eopkg (Solus)
@@ -270,7 +341,6 @@ proc getPackages(): int {.inline.} =
     "/var/lib/guix"                # Guix System
   ]
   
-  # Check directory-based package managers
   for dir in packageDirs:
     if dirExists(dir):
       var count = 0
@@ -282,7 +352,6 @@ proc getPackages(): int {.inline.} =
         result = count
         return result
   
-  # Check Apt (Debian, Ubuntu)
   let aptStatusFile = "/var/lib/dpkg/status"
   if fileExists(aptStatusFile):
     var seenPkg = false
@@ -297,7 +366,6 @@ proc getPackages(): int {.inline.} =
         seenPkg = false
     return result
   
-  # We couldn't find any known package manager
   return 0
 
 
@@ -340,7 +408,6 @@ proc getUptime(): string =
 
 
 proc getMemory(): string =
-  ## Get memory usage using Redhat and Htop method
   var 
     memTotal, memFree, buffers, cached, shmem, sreclaimable: int
   
@@ -357,10 +424,8 @@ proc getMemory(): string =
       of "Shmem": shmem = parts[1].strip().split()[0].parseInt()
       of "SReclaimable": sreclaimable = parts[1].strip().split()[0].parseInt()
   
-  # Calculate used memory
   let usedMem = memTotal - (memFree + buffers + cached) + (shmem - sreclaimable)
   
-  # Format the output based on size
   if usedMem >= 1048576:
     return fmt"{usedMem.float / gibDivisor:0.2f}GiB / {memTotal.float / gibDivisor:0.2f}GiB"
   else:
@@ -385,31 +450,37 @@ proc getColours(): string {.inline.} =
   let randIcon = icons[rand(icons.high)]
   fmt"{col.rosewater}{randIcon} {col.mauve}{randIcon} {col.pink}{randIcon} {col.maroon}{randIcon} {col.sky}{randIcon} {col.green}{randIcon} {col.lavender}{randIcon} "
 
+const
+  outputFormat = [
+    (22, 1, fmt"{col.rosewater}{icon.os}  {col.yellow}{col.bold}OS:{col.reset}      $#"),
+    (22, 2, fmt"{col.pink}{icon.kernel}  {col.yellow}{col.bold}Kernel:{col.reset}  $#"),
+    (22, 3, fmt"{col.mauve}{icon.desktop}  {col.yellow}{col.bold}DE/WM:{col.reset}   $#"),
+    (22, 4, fmt"{col.maroon}{icon.pkgs}  {col.yellow}{col.bold}Pkgs:{col.reset}    $#"),
+    (22, 5, fmt"{col.sky}{icon.shell}  {col.yellow}{col.bold}Shell:{col.reset}   $#"),
+    (22, 6, fmt"{col.green}{icon.uptime}  {col.yellow}{col.bold}Uptime:{col.reset}  $#"),
+    (22, 7, fmt"{col.lavender}{icon.memory}  {col.yellow}{col.bold}Memory:{col.reset}  $#"),
+    (30, 8, fmt"$#{col.reset}")
+  ]
+
+
+proc computeLogoCells(): tuple[cols, rows: int] =
+  let metrics = getCellMetrics()
+  let cw = max(1.0, metrics.cellWidth)
+  let ch = max(1.0, metrics.cellHeight)
+  let cols = max(1, int(ceil(LogoPixelSize.float / cw)))
+  let rows = max(1, int(ceil(LogoPixelSize.float / ch)))
+  (cols, rows)
+
+
 when isMainModule:
   randomize()
   stdout.eraseScreen()
 
-  let logoName = detectLogoName()
-  let logo = loadLogo(logoName)
-
-  stdout.setCursorPos(1, 1)
+  let kittyCapable = supportsKittyGraphics()
+  let detectedLogoName = detectLogoName()
+  var logo = loadLogo(detectedLogoName)
   if logo.len == 0:
-    let fallback = loadLogo(DefaultLogoName)
-    if fallback.len > 0:
-      stdout.write(fallback)
-  else:
-    stdout.write(logo)
-
-  const outputFormat = [
-    (18, 1, fmt"{col.rosewater}{icon.os}  {col.yellow}{col.bold}OS:{col.reset}      $#"),
-    (18, 2, fmt"{col.pink}{icon.kernel}  {col.yellow}{col.bold}Kernel:{col.reset}  $#"),
-    (18, 3, fmt"{col.mauve}{icon.desktop}  {col.yellow}{col.bold}DE/WM:{col.reset}   $#"),
-    (18, 4, fmt"{col.maroon}{icon.pkgs}  {col.yellow}{col.bold}Pkgs:{col.reset}    $#"),
-    (18, 5, fmt"{col.sky}{icon.shell}  {col.yellow}{col.bold}Shell:{col.reset}   $#"),
-    (18, 6, fmt"{col.green}{icon.uptime}  {col.yellow}{col.bold}Uptime:{col.reset}  $#"),
-    (18, 7, fmt"{col.lavender}{icon.memory}  {col.yellow}{col.bold}Memory:{col.reset}  $#"),
-    (26, 8, fmt"$#{col.reset}" & "\n\n"),
-  ]
+    logo = loadLogo(DefaultLogoName)
 
   let values = [
     getOS(),
@@ -422,8 +493,16 @@ when isMainModule:
     getColours()
   ]
 
+  if kittyCapable and logo.len > 0:
+    stdout.setCursorPos(1, 1)
+    let placement = computeLogoCells()
+    displayKittyImage(logo, placement.cols, placement.rows)
+  else:
+    stdout.setCursorPos(1, 1)
+    stdout.write(AsciiFallbackLogo)
+
   for i, (y, x, format) in outputFormat.pairs:
     stdout.setCursorPos(y, x)
     stdout.write(format % values[i])
-
+  stdout.write("\n\n")
   stdout.flushFile()
