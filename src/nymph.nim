@@ -50,23 +50,14 @@ const
 
   col = (
     rosewater: "\x1b[38;2;245;224;220m",
-    flamingo:  "\x1b[38;2;242;205;205m",
     pink:      "\x1b[38;2;245;194;231m",
     mauve:     "\x1b[38;2;203;166;247m",
-    red:       "\x1b[38;2;243;139;168m",
     maroon:    "\x1b[38;2;235;160;172m",
-    peach:     "\x1b[38;2;250;179;135m",
     yellow:    "\x1b[38;2;249;226;175m",
     green:     "\x1b[38;2;166;227;161m",
-    teal:      "\x1b[38;2;148;226;213m",
     sky:       "\x1b[38;2;137;220;235m",
-    sapphire:  "\x1b[38;2;116;199;236m",
-    blue:      "\x1b[38;2;137;180;250m",
     lavender:  "\x1b[38;2;180;190;254m",
     bold:      "\x1b[1m",
-    rbold:     "\x1b[22m",
-    itali:     "\x1b[3m",
-    ritali:    "\x1b[23m",
     reset:     "\x1b[0m",
   )
 
@@ -99,20 +90,27 @@ proc normalizeDir(path: string): string =
 
 proc getLogoSearchDirs(): seq[string] =
   ## Assemble all directories we search for logos (env/app/source/project).
-  var dirs = @[sourceLogoDir, projectLogoDir]
   let envDir = getEnv("NYMPH_LOGO_DIR")
-  if envDir.len > 0: dirs.add envDir
   let appDir = getAppDir()
-  if appDir.len > 0:
-    dirs.add appDir / "logos"
-    dirs.add appDir / "../share/nymph/logos"
-
   var seen = initHashSet[string]()
-  for dir in dirs:
+  for dir in [sourceLogoDir, projectLogoDir]:
     let norm = normalizeDir(dir)
     if norm.len > 0 and not seen.contains(norm):
       seen.incl(norm)
       result.add norm
+
+  if envDir.len > 0:
+    let norm = normalizeDir(envDir)
+    if norm.len > 0 and not seen.contains(norm):
+      seen.incl(norm)
+      result.add norm
+
+  if appDir.len > 0:
+    for dir in [appDir / "logos", appDir / "../share/nymph/logos"]:
+      let norm = normalizeDir(dir)
+      if norm.len > 0 and not seen.contains(norm):
+        seen.incl(norm)
+        result.add norm
 
 
 proc locateLogoFile(name, ext: string): string =
@@ -184,11 +182,21 @@ proc getCellMetrics(): tuple[cellWidth, cellHeight: float] =
 
 
 proc supportsKittyGraphics(): bool {.inline.} =
-  ## Detect whether we’re running inside Kitty.
+  ## Detect whether we’re inside a terminal that speaks Kitty graphics.
+  const kittyFriendlyTerms: array[4, string] = ["kitty", "wezterm", "ghostty", "konsole"]
   let term = getEnv("TERM").toLowerAscii()
-  if term.contains("kitty"): return true
+  let termProgram = getEnv("TERM_PROGRAM").toLowerAscii()
+  let terminalEmu = getEnv("TERMINAL_EMULATOR").toLowerAscii()
+
+  for name in kittyFriendlyTerms:
+    if term.contains(name): return true
+    if termProgram.contains(name): return true
+    if terminalEmu.contains(name): return true
+
   if getEnv("KITTY_WINDOW_ID").len > 0: return true
-  if getEnv("TERM_PROGRAM").toLowerAscii() == "kitty": return true
+  if getEnv("WEZTERM_VERSION").len > 0 or getEnv("WEZTERM_EXECUTABLE").len > 0: return true
+  if getEnv("GHOSTTY_RESOURCES_DIR").len > 0: return true
+  if getEnv("KONSOLE_VERSION").len > 0 or getEnv("KONSOLE_DBUS_SESSION").len > 0: return true
   false
 
 
@@ -206,12 +214,11 @@ proc displayKittyGraphics(logoBytes: string; columns, rows: int) =
       controlParts.add("a=T")
       controlParts.add("f=100")
       controlParts.add("t=d")
-      controlParts.add("q=2")
+      controlParts.add("q=2") # suppress OK replies so shells don’t see them
       controlParts.add("C=1")
       if columns > 0: controlParts.add("c=" & $columns)
       if rows > 0: controlParts.add("r=" & $rows)
-    if chunkEnd < encoded.len:
-      controlParts.add("m=1")
+    controlParts.add("m=" & (if chunkEnd < encoded.len: "1" else: "0"))
     stdout.write("\x1b_G")
     if controlParts.len > 0:
       stdout.write(controlParts.join(","))
@@ -249,24 +256,16 @@ proc sanitizeLogoName(name: string): string =
 
 proc findBestLogoMatch(candidates: seq[string]): string =
   ## Pick the first candidate that matches an available logo.
-  var available = collectAvailableLogos()
+  let available = collectAvailableLogos()
   if available.len == 0:
     return ""
-
-  let availSet = block:
-    var tmp = initHashSet[string]()
-    for name in available:
-      tmp.incl(name)
-    tmp
 
   proc tryMatch(value: string): string =
     let sanitized = sanitizeLogoName(value)
     if sanitized.len == 0:
       return ""
-    if sanitized in availSet:
-      return sanitized
     for avail in available:
-      if avail.contains(sanitized) or sanitized.contains(avail):
+      if avail == sanitized or avail.contains(sanitized) or sanitized.contains(avail):
         return avail
     ""
 
@@ -350,10 +349,9 @@ proc getOS(): string {.inline.} =
       elif line.startsWith("NAME="):
         distroname = line.split('=', 1)[1].strip(chars = {'"', '\''})
 
-  if distroname != "":
-    return distroname
-
-  return "Unknown Linux Distribution"
+  if distroname.len == 0:
+    return "Unknown Linux Distribution"
+  distroname
 
 
 proc getKernel(): string {.inline.} =
