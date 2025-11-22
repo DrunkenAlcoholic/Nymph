@@ -524,11 +524,15 @@ proc computeLogoCells(logo: LogoData): tuple[cols, rows: int] =
   let targetHeight = logo.height.float * scale
   var cols = max(1, int(ceil(targetWidth.float / cw)))
   var rows = max(1, int(ceil(targetHeight / ch)))
-  # Keep the logo from consuming the entire viewport.
+  # Keep the logo from consuming the entire viewport; if too wide, scale down.
   let maxCols = max(1, terminalWidth())
   let maxRows = max(1, terminalHeight())
-  if cols >= maxCols: cols = maxCols - 1
-  if rows >= maxRows: rows = maxRows - 1
+  if cols >= maxCols:
+    let scaleDown = (maxCols - 1).float / cols.float
+    cols = max(1, int(ceil(cols.float * scaleDown)))
+    rows = max(1, int(ceil(rows.float * scaleDown)))
+  if rows >= maxRows:
+    rows = maxRows - 1
   (cols, rows)
 
 
@@ -537,7 +541,9 @@ proc computeStatsOffset(): int =
   let metrics = getCellMetrics()
   let cw = max(1.0, metrics.cellWidth)
   let colsFromLogo = int(ceil(MaxLogoWidth.float / cw)) + 2 # padding
-  max(StatsOffsetBase, colsFromLogo)
+  let base = max(StatsOffsetBase, colsFromLogo)
+  let maxCols = max(1, terminalWidth())
+  min(base, maxCols - 1)
 
 
 when isMainModule:
