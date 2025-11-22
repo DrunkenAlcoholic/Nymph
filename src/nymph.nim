@@ -13,8 +13,8 @@ const
   sourceLogoDir = parentDir(currentSourcePath()) / "logos"
   projectLogoDir = parentDir(parentDir(currentSourcePath())) / "logos"
   MaxLogoWidth = 200           # Clamp rendered PNG width so stats have room.
-  ## Column where the stats should start; bump this if you raise MaxLogoWidth.
-  StatsOffset = 22
+  ## Column where the stats should start; bumped automatically from MaxLogoWidth.
+  StatsOffsetBase = 22
   kittyChunkSize = 4096
   AsciiFallbackLogo = """  
       .---.   
@@ -500,16 +500,18 @@ type StatEntry = object
   formatter: string
   getter: proc(): string {.closure.}
 
-const statsEntries: array[8, StatEntry] = [
-  StatEntry(col: StatsOffset, row: 1, formatter: fmt"{col.rosewater}{icon.os}  {col.yellow}{col.bold}OS:{col.reset}      $#", getter: proc(): string = getOS()),
-  StatEntry(col: StatsOffset, row: 2, formatter: fmt"{col.pink}{icon.kernel}  {col.yellow}{col.bold}Kernel:{col.reset}  $#", getter: proc(): string = getKernel()),
-  StatEntry(col: StatsOffset, row: 3, formatter: fmt"{col.mauve}{icon.desktop}  {col.yellow}{col.bold}DE/WM:{col.reset}   $#", getter: proc(): string = getDE()),
-  StatEntry(col: StatsOffset, row: 4, formatter: fmt"{col.maroon}{icon.pkgs}  {col.yellow}{col.bold}Pkgs:{col.reset}    $#", getter: proc(): string = $getPackages()),
-  StatEntry(col: StatsOffset, row: 5, formatter: fmt"{col.sky}{icon.shell}  {col.yellow}{col.bold}Shell:{col.reset}   $#", getter: proc(): string = getShell()),
-  StatEntry(col: StatsOffset, row: 6, formatter: fmt"{col.green}{icon.uptime}  {col.yellow}{col.bold}Uptime:{col.reset}  $#", getter: proc(): string = getUptime()),
-  StatEntry(col: StatsOffset, row: 7, formatter: fmt"{col.lavender}{icon.memory}  {col.yellow}{col.bold}Memory:{col.reset}  $#", getter: proc(): string = getMemory()),
-  StatEntry(col: StatsOffset, row: 8, formatter: fmt"       $#{col.reset}", getter: proc(): string = getColours())
-]
+proc statsEntries(statsCol: int): seq[StatEntry] =
+  ## Build the ordered list of stats rows with their value suppliers.
+  result = @[
+    StatEntry(col: statsCol, row: 1, formatter: fmt"{col.rosewater}{icon.os}  {col.yellow}{col.bold}OS:{col.reset}      $#", getter: proc(): string = getOS()),
+    StatEntry(col: statsCol, row: 2, formatter: fmt"{col.pink}{icon.kernel}  {col.yellow}{col.bold}Kernel:{col.reset}  $#", getter: proc(): string = getKernel()),
+    StatEntry(col: statsCol, row: 3, formatter: fmt"{col.mauve}{icon.desktop}  {col.yellow}{col.bold}DE/WM:{col.reset}   $#", getter: proc(): string = getDE()),
+    StatEntry(col: statsCol, row: 4, formatter: fmt"{col.maroon}{icon.pkgs}  {col.yellow}{col.bold}Pkgs:{col.reset}    $#", getter: proc(): string = $getPackages()),
+    StatEntry(col: statsCol, row: 5, formatter: fmt"{col.sky}{icon.shell}  {col.yellow}{col.bold}Shell:{col.reset}   $#", getter: proc(): string = getShell()),
+    StatEntry(col: statsCol, row: 6, formatter: fmt"{col.green}{icon.uptime}  {col.yellow}{col.bold}Uptime:{col.reset}  $#", getter: proc(): string = getUptime()),
+    StatEntry(col: statsCol, row: 7, formatter: fmt"{col.lavender}{icon.memory}  {col.yellow}{col.bold}Memory:{col.reset}  $#", getter: proc(): string = getMemory()),
+    StatEntry(col: statsCol, row: 8, formatter: fmt"       $#{col.reset}", getter: proc(): string = getColours())
+  ]
 
 
 proc computeLogoCells(logo: LogoData): tuple[cols, rows: int] =
@@ -520,9 +522,22 @@ proc computeLogoCells(logo: LogoData): tuple[cols, rows: int] =
   let targetWidth = min(logo.width, MaxLogoWidth)
   let scale = targetWidth.float / max(logo.width.float, 1.0)
   let targetHeight = logo.height.float * scale
-  let cols = max(1, int(ceil(targetWidth.float / cw)))
-  let rows = max(1, int(ceil(targetHeight / ch)))
+  var cols = max(1, int(ceil(targetWidth.float / cw)))
+  var rows = max(1, int(ceil(targetHeight / ch)))
+  # Keep the logo from consuming the entire viewport.
+  let maxCols = max(1, terminalWidth())
+  let maxRows = max(1, terminalHeight())
+  if cols >= maxCols: cols = maxCols - 1
+  if rows >= maxRows: rows = maxRows - 1
   (cols, rows)
+
+
+proc computeStatsOffset(): int =
+  ## Derive a stats start column based on logo width and cell metrics.
+  let metrics = getCellMetrics()
+  let cw = max(1.0, metrics.cellWidth)
+  let colsFromLogo = int(ceil(MaxLogoWidth.float / cw)) + 2 # padding
+  max(StatsOffsetBase, colsFromLogo)
 
 
 when isMainModule:
@@ -544,8 +559,9 @@ when isMainModule:
     stdout.setCursorPos(1, 1)
     stdout.write(AsciiFallbackLogo)
 
+  let statsCol = computeStatsOffset()
   # Render stats block next to the logo.
-  for entry in statsEntries:
+  for entry in statsEntries(statsCol):
     stdout.setCursorPos(entry.col, entry.row)
     stdout.write(entry.formatter % entry.getter())
   stdout.write("\n\n")
