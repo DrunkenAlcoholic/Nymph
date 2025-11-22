@@ -8,13 +8,18 @@ type
     width: int
     height: int
 
+  RuntimeConfig = object
+    maxLogoWidth: int
+    statsOffset: int
+    logoDir: string
+    configLogoDir: string
+
 const
   DefaultLogoName = "generic"
   sourceLogoDir = parentDir(currentSourcePath()) / "logos"
   projectLogoDir = parentDir(parentDir(currentSourcePath())) / "logos"
-  MaxLogoWidth = 200           # Clamp rendered PNG width so stats have room.
-  ## Column where the stats should start; bumped automatically from MaxLogoWidth.
-  StatsOffsetBase = 22
+  DefaultMaxLogoWidth = 200    # Clamp rendered PNG width so stats have room.
+  DefaultStatsOffsetBase = 22  # Column where the stats should start by default.
   kittyChunkSize = 4096
   AsciiFallbackLogo = """  
       .---.   
@@ -88,16 +93,106 @@ proc normalizeDir(path: string): string =
     absolutePath(expanded)
 
 
+proc defaultConfig(): RuntimeConfig =
+  RuntimeConfig(
+    maxLogoWidth: DefaultMaxLogoWidth,
+    statsOffset: DefaultStatsOffsetBase,
+    logoDir: ""
+  )
+
+var appConfig: RuntimeConfig = defaultConfig()
+
+
+proc configPaths(): seq[string] =
+  let envCfg = getEnv("NYMPH_CONFIG")
+  if envCfg.len > 0:
+    result.add envCfg
+  let xdg = getEnv("XDG_CONFIG_HOME")
+  if xdg.len > 0:
+    result.add normalizeDir(xdg / "nymph" / "config.toml")
+  else:
+    result.add normalizeDir(getHomeDir() / ".config" / "nymph" / "config.toml")
+  result.add "/etc/xdg/nymph/config.toml"
+
+
+proc loadConfig(): RuntimeConfig =
+  ## Simple key=value parser; ignores unknown keys.
+  result = defaultConfig()
+  var found = false
+  for path in configPaths():
+    if not fileExists(path): continue
+    found = true
+    try:
+      for rawLine in lines(path):
+        var line = rawLine.strip()
+        if line.len == 0 or line.startsWith("#"): continue
+        let parts = line.split("=", 1)
+        if parts.len != 2: continue
+        let key = parts[0].strip().toLowerAscii()
+        let val = parts[1].strip()
+        case key
+        of "maxwidth":
+          try:
+            let v = val.parseInt()
+            if v > 0: result.maxLogoWidth = v
+          except ValueError:
+            discard
+        of "statsoffset":
+          try:
+            let v = val.parseInt()
+            if v > 0: result.statsOffset = v
+          except ValueError:
+            discard
+        of "logodir":
+          if val.len > 0: result.logoDir = val
+        else:
+          discard
+    except IOError:
+      discard
+
+  if not found:
+    let homeCfg = normalizeDir(getHomeDir() / ".config" / "nymph")
+    try:
+      if not dirExists(homeCfg):
+        createDir(homeCfg)
+      let logoCfgDir = homeCfg / "logos"
+      if not dirExists(logoCfgDir):
+        createDir(logoCfgDir)
+      result.configLogoDir = logoCfgDir
+      let path = homeCfg / "config.toml"
+      if not fileExists(path):
+        let content = fmt"maxwidth={result.maxLogoWidth}\nstatsoffset={result.statsOffset}\n# logodir=/path/to/logos\n"
+        writeFile(path, content)
+    except IOError:
+      discard
+  else:
+    let homeCfg = normalizeDir(getHomeDir() / ".config" / "nymph" / "logos")
+    if dirExists(homeCfg):
+      result.configLogoDir = homeCfg
+
+
 proc getLogoSearchDirs(): seq[string] =
   ## Assemble all directories we search for logos (env/app/source/project).
   let envDir = getEnv("NYMPH_LOGO_DIR")
   let appDir = getAppDir()
   var seen = initHashSet[string]()
+
   for dir in [sourceLogoDir, projectLogoDir]:
     let norm = normalizeDir(dir)
     if norm.len > 0 and not seen.contains(norm):
       seen.incl(norm)
       result.add norm
+
+  if appConfig.configLogoDir.len > 0:
+    let norm = normalizeDir(appConfig.configLogoDir)
+    if norm.len > 0 and not seen.contains(norm):
+      seen.incl(norm)
+      result.add norm
+
+  let cfgDir = normalizeDir(appConfig.logoDir)
+  if cfgDir.len > 0 and not seen.contains(cfgDir):
+    seen.incl(cfgDir)
+    result.add cfgDir
 
   if envDir.len > 0:
     let norm = normalizeDir(envDir)
@@ -519,7 +614,7 @@ proc computeLogoCells(logo: LogoData): tuple[cols, rows: int] =
   let metrics = getCellMetrics()
   let cw = max(1.0, metrics.cellWidth)
   let ch = max(1.0, metrics.cellHeight)
-  let targetWidth = min(logo.width, MaxLogoWidth)
+  let targetWidth = min(logo.width, appConfig.maxLogoWidth)
   let scale = targetWidth.float / max(logo.width.float, 1.0)
   let targetHeight = logo.height.float * scale
   var cols = max(1, int(ceil(targetWidth.float / cw)))
@@ -543,8 +638,8 @@ proc computeStatsOffset(): int =
   ## Derive a stats start column based on logo width and cell metrics.
   let metrics = getCellMetrics()
   let cw = max(1.0, metrics.cellWidth)
-  let colsFromLogo = int(ceil(MaxLogoWidth.float / cw)) + 2 # padding
-  let base = max(StatsOffsetBase, colsFromLogo)
+  let colsFromLogo = int(ceil(appConfig.maxLogoWidth.float / cw)) + 2 # padding
+  let base = max(appConfig.statsOffset, colsFromLogo)
   let maxCols = max(1, terminalWidth())
   min(base, maxCols div 2 + 2)
 
@@ -552,6 +647,8 @@ proc computeStatsOffset(): int =
 when isMainModule:
   randomize()
   stdout.eraseScreen()
+
+  appConfig = loadConfig()
 
   # Resolve logo name and load PNG bytes/dimensions if possible.
   let kittyCapable = supportsKittyGraphics()
