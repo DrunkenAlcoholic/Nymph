@@ -6,7 +6,7 @@ srcDir        = "src"
 bin           = @["nymph"]
 binDir        = "bin"
 
-requires "nim >= 1.6.0"
+requires "nim >= 2.0.0"
 
 # Build tasks
 task release, "Build the application with release flags":

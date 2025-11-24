@@ -1,5 +1,5 @@
-import std/[os, terminal, math, strutils, strformat, dirs, random, sets, base64, posix]
-
+import std/[os, terminal, math, strutils, strformat, random, sets, posix]
+import kitty_proto, nymph_settings
 
 type
   # Holds raw PNG bytes and dimensions so we can size the Kitty placement.
@@ -8,19 +8,10 @@ type
     width: int
     height: int
 
-  RuntimeConfig = object
-    maxLogoWidth: int
-    statsOffset: int
-    logoDir: string
-    configLogoDir: string
-
 const
   DefaultLogoName = "generic"
   sourceLogoDir = parentDir(currentSourcePath()) / "logos"
   projectLogoDir = parentDir(parentDir(currentSourcePath())) / "logos"
-  DefaultMaxLogoWidth = 200    # Clamp rendered PNG width so stats have room.
-  DefaultStatsOffsetBase = 22  # Column where the stats should start by default.
-  kittyChunkSize = 4096
   AsciiFallbackLogo = """  
       .---.   
       /     \    
@@ -66,109 +57,10 @@ const
     reset:     "\x1b[0m",
   )
 
-
-proc normalizeDir(path: string): string =
-  ## Expand ~, remove duplicates, and produce an absolute path.
-  if path.len == 0:
-    return ""
-
-  var expanded = path
-  if expanded[0] == '~':
-    let home = getHomeDir()
-    if home.len > 0:
-      if expanded.len == 1:
-        expanded = home
-      else:
-        var suffix = expanded[1 .. expanded.high]
-        if suffix.len > 0 and (suffix[0] == DirSep or suffix[0] == '/'):
-          if suffix.len > 1:
-            suffix = suffix[1 .. suffix.high]
-          else:
-            suffix = ""
-        expanded = home / suffix
-
-  if isAbsolute(expanded):
-    expanded
-  else:
-    absolutePath(expanded)
-
-
-proc defaultConfig(): RuntimeConfig =
-  RuntimeConfig(
-    maxLogoWidth: DefaultMaxLogoWidth,
-    statsOffset: DefaultStatsOffsetBase,
-    logoDir: ""
-  )
-
 var appConfig: RuntimeConfig = defaultConfig()
-
-
-proc configPaths(): seq[string] =
-  let envCfg = getEnv("NYMPH_CONFIG")
-  if envCfg.len > 0:
-    result.add envCfg
-  let xdg = getEnv("XDG_CONFIG_HOME")
-  if xdg.len > 0:
-    result.add normalizeDir(xdg / "nymph" / "config.toml")
-  else:
-    result.add normalizeDir(getHomeDir() / ".config" / "nymph" / "config.toml")
-  result.add "/etc/xdg/nymph/config.toml"
-
-
-proc loadConfig(): RuntimeConfig =
-  ## Simple key=value parser; ignores unknown keys.
-  result = defaultConfig()
-  var found = false
-  for path in configPaths():
-    if not fileExists(path): continue
-    found = true
-    try:
-      for rawLine in lines(path):
-        var line = rawLine.strip()
-        if line.len == 0 or line.startsWith("#"): continue
-        let parts = line.split("=", 1)
-        if parts.len != 2: continue
-        let key = parts[0].strip().toLowerAscii()
-        let val = parts[1].strip()
-        case key
-        of "maxwidth":
-          try:
-            let v = val.parseInt()
-            if v > 0: result.maxLogoWidth = v
-          except ValueError:
-            discard
-        of "statsoffset":
-          try:
-            let v = val.parseInt()
-            if v > 0: result.statsOffset = v
-          except ValueError:
-            discard
-        of "logodir":
-          if val.len > 0: result.logoDir = val
-        else:
-          discard
-    except IOError:
-      discard
-
-  if not found:
-    let homeCfg = normalizeDir(getHomeDir() / ".config" / "nymph")
-    try:
-      if not dirExists(homeCfg):
-        createDir(homeCfg)
-      let logoCfgDir = homeCfg / "logos"
-      if not dirExists(logoCfgDir):
-        createDir(logoCfgDir)
-      result.configLogoDir = logoCfgDir
-      let path = homeCfg / "config.toml"
-      if not fileExists(path):
-        let content = fmt"maxwidth={result.maxLogoWidth}\nstatsoffset={result.statsOffset}\n# logodir=/path/to/logos\n"
-        writeFile(path, content)
-    except IOError:
-      discard
-  else:
-    let homeCfg = normalizeDir(getHomeDir() / ".config" / "nymph" / "logos")
-    if dirExists(homeCfg):
-      result.configLogoDir = homeCfg
+var disableColor = false
+var metricsCached = false
+var cachedMetrics: tuple[cellWidth, cellHeight: float]
 
 
 proc getLogoSearchDirs(): seq[string] =
@@ -189,11 +81,6 @@ proc getLogoSearchDirs(): seq[string] =
       seen.incl(norm)
       result.add norm
 
-  let cfgDir = normalizeDir(appConfig.logoDir)
-  if cfgDir.len > 0 and not seen.contains(cfgDir):
-    seen.incl(cfgDir)
-    result.add cfgDir
-
   if envDir.len > 0:
     let norm = normalizeDir(envDir)
     if norm.len > 0 and not seen.contains(norm):
@@ -201,11 +88,10 @@ proc getLogoSearchDirs(): seq[string] =
       result.add norm
 
   if appDir.len > 0:
-    for dir in [appDir / "logos", appDir / "../share/nymph/logos"]:
-      let norm = normalizeDir(dir)
-      if norm.len > 0 and not seen.contains(norm):
-        seen.incl(norm)
-        result.add norm
+    let dir = normalizeDir(appDir / "logos")
+    if dir.len > 0 and not seen.contains(dir):
+      seen.incl(dir)
+      result.add dir
 
 
 proc locateLogoFile(name, ext: string): string =
@@ -242,6 +128,22 @@ proc loadLogo(name: string): LogoData =
     discard
 
 
+proc loadLogoFromPath(path: string): LogoData =
+  ## Load a PNG from an explicit path.
+  let norm = normalizeDir(path)
+  if norm.len == 0 or not fileExists(norm): return
+  try:
+    let raw = readFile(norm)
+    if raw.len == 0: return
+    let (w, h) = parsePngDims(raw)
+    if w <= 0 or h <= 0: return
+    result.bytes = raw
+    result.width = w
+    result.height = h
+  except IOError:
+    discard
+
+
 when defined(posix):
   type
     TermWinSize = object
@@ -251,7 +153,6 @@ when defined(posix):
       ws_ypixel: cushort
 
   const ioctlWinSize = culong(0x5413)
-
 
 proc getWindowPixels(): tuple[width, height: int] =
   ## Query the terminal window size in pixels (falls back to 0s).
@@ -263,7 +164,10 @@ proc getWindowPixels(): tuple[width, height: int] =
 
 
 proc getCellMetrics(): tuple[cellWidth, cellHeight: float] =
-  ## Derive approximate cell width/height in pixels from window metrics.
+  ## Derive approximate cell width/height in pixels from window metrics (cached).
+  if metricsCached:
+    return cachedMetrics
+
   let cols = terminalWidth()
   let rows = terminalHeight()
   let winPixels = getWindowPixels()
@@ -273,57 +177,10 @@ proc getCellMetrics(): tuple[cellWidth, cellHeight: float] =
     cellWidth = winPixels.width.float / cols.float
   if winPixels.height > 0 and rows > 0:
     cellHeight = winPixels.height.float / rows.float
-  (cellWidth, cellHeight)
 
-
-proc supportsKittyGraphics(): bool {.inline.} =
-  ## Detect whether we’re inside a terminal that speaks Kitty graphics.
-  const kittyFriendlyTerms: array[4, string] = ["kitty", "wezterm", "ghostty", "konsole"]
-  let term = getEnv("TERM").toLowerAscii()
-  let termProgram = getEnv("TERM_PROGRAM").toLowerAscii()
-  let terminalEmu = getEnv("TERMINAL_EMULATOR").toLowerAscii()
-
-  for name in kittyFriendlyTerms:
-    if term.contains(name): return true
-    if termProgram.contains(name): return true
-    if terminalEmu.contains(name): return true
-
-  if getEnv("KITTY_WINDOW_ID").len > 0: return true
-  if getEnv("WEZTERM_VERSION").len > 0 or getEnv("WEZTERM_EXECUTABLE").len > 0: return true
-  if getEnv("GHOSTTY_RESOURCES_DIR").len > 0: return true
-  if getEnv("KONSOLE_VERSION").len > 0 or getEnv("KONSOLE_DBUS_SESSION").len > 0: return true
-  false
-
-
-proc displayKittyGraphics(logoBytes: string; columns, rows: int) =
-  ## Stream the PNG bytes via Kitty’s graphics protocol.
-  if logoBytes.len == 0: return
-  let encoded = encode(logoBytes)
-  var offset = 0
-  var firstChunk = true
-  while offset < encoded.len:
-    let chunkEnd = min(offset + kittyChunkSize, encoded.len)
-    let chunk = encoded[offset ..< chunkEnd]
-    var controlParts: seq[string] = @[]
-    if firstChunk:
-      controlParts.add("a=T")
-      controlParts.add("f=100")
-      controlParts.add("t=d")
-      controlParts.add("q=2") # suppress OK replies so shells don’t see them
-      controlParts.add("C=1")
-      if columns > 0: controlParts.add("c=" & $columns)
-      if rows > 0: controlParts.add("r=" & $rows)
-    controlParts.add("m=" & (if chunkEnd < encoded.len: "1" else: "0"))
-    stdout.write("\x1b_G")
-    if controlParts.len > 0:
-      stdout.write(controlParts.join(","))
-    if chunk.len > 0:
-      stdout.write(";")
-      stdout.write(chunk)
-    stdout.write("\x1b\\")
-    offset = chunkEnd
-    firstChunk = false
-
+  cachedMetrics = (cellWidth: cellWidth, cellHeight: cellHeight)
+  metricsCached = true
+  cachedMetrics
 
 proc collectAvailableLogos(): seq[string] =
   ## Enumerate unique logo names detected across all search paths.
@@ -380,26 +237,26 @@ proc findBestLogoMatch(candidates: seq[string]): string =
   available[0]
 
 
-proc parseLogoOverride(): string =
-  ## Parse --logo CLI arguments (supports “--logo foo” and “--logo=foo”).
+proc parseCliOptions(): tuple[logo: string, noColor: bool] =
+  ## Parse minimal CLI flags: logo override and --no-color toggle.
   let params = commandLineParams()
   var i = 0
   while i < params.len:
     let param = params[i]
     if param.startsWith("--logo=") or param.startsWith("-logo="):
-      return param.split('=', 1)[1]
+      result.logo = param.split('=', 1)[1]
     elif param == "--logo" or param == "-logo":
       if i + 1 < params.len:
-        return params[i + 1]
+        result.logo = params[i + 1]
+    elif param == "--no-color" or param == "--no-colors":
+      result.noColor = true
     inc i
-  ""
 
 
-proc detectLogoName(): string =
+proc detectLogoName(cliLogo: string): string =
   ## Build a list of candidate names from CLI, env vars, and os-release.
   var candidates: seq[string] = @[]
 
-  let cliLogo = parseLogoOverride()
   if cliLogo.len > 0:
     candidates.add cliLogo
 
@@ -644,16 +501,42 @@ proc computeStatsOffset(): int =
   min(base, maxCols div 2 + 2)
 
 
+proc stripAnsi(text: string): string =
+  ## Remove ANSI escape sequences for --no-color output.
+  var i = 0
+  while i < text.len:
+    if text[i] == '\x1b' and i + 1 < text.len and text[i + 1] == '[':
+      var j = i + 2
+      while j < text.len and text[j] notin {'m', '\\'}:
+        inc j
+      if j < text.len:
+        i = j + 1
+        continue
+    result.add(text[i])
+    inc i
+
+
 when isMainModule:
   randomize()
   stdout.eraseScreen()
 
   appConfig = loadConfig()
+  let cli = parseCliOptions()
+  if cli.noColor or appConfig.noColor:
+    disableColor = true
+  let logoOverride = cli.logo
 
   # Resolve logo name and load PNG bytes/dimensions if possible.
+  var logo: LogoData
+  let overridePath = normalizeDir(logoOverride)
+  if overridePath.len > 0 and fileExists(overridePath):
+    logo = loadLogoFromPath(overridePath)
+  elif appConfig.customLogoFile.len > 0:
+    logo = loadLogoFromPath(appConfig.customLogoFile)
   let kittyCapable = supportsKittyGraphics()
-  let detectedLogoName = detectLogoName()
-  var logo = loadLogo(detectedLogoName)
+  let detectedLogoName = detectLogoName(if overridePath.len == 0: logoOverride else: "")
+  if logo.bytes.len == 0:
+    logo = loadLogo(detectedLogoName)
   if logo.bytes.len == 0:
     logo = loadLogo(DefaultLogoName)
 
@@ -669,6 +552,7 @@ when isMainModule:
   # Render stats block next to the logo.
   for entry in statsEntries(statsCol):
     stdout.setCursorPos(entry.col, entry.row)
-    stdout.write(entry.formatter % entry.getter())
+    let line = entry.formatter % entry.getter()
+    stdout.write(if disableColor: stripAnsi(line) else: line)
   stdout.write("\n\n")
   stdout.flushFile()
