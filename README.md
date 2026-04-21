@@ -11,6 +11,7 @@ Nymph is a lightweight system summary tool (fetch utility) written in Nim, with 
 - Fast startup and minimal dependencies
 - PNG logos via Kitty graphics protocol (with ASCII fallback)
 - Customizable output: themes, icon packs, layouts, and modules
+- RAM usage level bar with percentage and numeric usage
 - Script-friendly JSON mode
 - Built-in diagnostics mode for setup troubleshooting
 
@@ -139,6 +140,16 @@ Layout defaults:
 - `compact`: `os,kernel,desktop,packages,memory,uptime`
 - `minimal`: `os,kernel,packages,memory`
 
+## Memory Bar
+
+The `memory` module shows both numeric usage and a compact level bar:
+
+```text
+Memory:  ██░░░░░░░░ 16% 5.10GiB
+```
+
+The bar uses Nerd Font block glyphs with theme colors by default, and falls back to plain ASCII when `--no-color`, the `plain` theme, or a non-Nerd icon pack is active.
+
 ## Logos
 
 Nymph searches for `<name>.png` in this order:
@@ -162,6 +173,7 @@ Notes:
 `--json` returns keys such as:
 
 - `os`, `kernel`, `desktop`, `shell`, `uptime`, `memory`
+- `memory_info.known`, `memory_info.used_kib`, `memory_info.total_kib`, `memory_info.percent`
 - `packages.total`
 - `packages.sources` (per-manager counts)
 - `theme`, `icon_pack`, `layout`, `modules`

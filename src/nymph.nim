@@ -38,6 +38,13 @@ type
     total: int
     sources: seq[PackageSource]
 
+  MemoryInfo = object
+    text: string
+    usedKiB: int
+    totalKiB: int
+    percent: float
+    known: bool
+
   ModuleKind = enum
     mkOS,
     mkKernel,
@@ -67,7 +74,7 @@ type
     desktop: string
     shell: string
     uptime: string
-    memory: string
+    memory: MemoryInfo
     packages: PackageSummary
 
   StatEntry = object
@@ -776,7 +783,7 @@ proc getUptime(): string =
   fmt"{uptimeDays} days, {hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-proc getMemory(): string =
+proc getMemory(): MemoryInfo =
   var memTotal, memAvailable: int
 
   proc parseMemField(value: string): int =
@@ -785,6 +792,8 @@ proc getMemory(): string =
       try: return fields[0].parseInt()
       except ValueError: discard
     0
+
+  result.text = "Unknown memory"
 
   if fileExists(meminfoPath):
     for line in lines(meminfoPath):
@@ -800,13 +809,18 @@ proc getMemory(): string =
         discard
 
   if memTotal <= 0 or memAvailable <= 0:
-    return "Unknown memory"
+    return
 
-  let usedMem = memTotal - memAvailable
+  let usedMem = max(0, memTotal - memAvailable)
+  result.usedKiB = usedMem
+  result.totalKiB = memTotal
+  result.percent = min(100.0, max(0.0, usedMem.float / memTotal.float * 100.0))
+  result.known = true
 
   if usedMem >= 1048576:
-    return fmt"{usedMem.float / gibDivisor:0.2f}GiB / {memTotal.float / gibDivisor:0.2f}GiB"
-  fmt"{usedMem div mibDivisor}MiB / {memTotal div mibDivisor}MiB"
+    result.text = formatFloat(usedMem.float / gibDivisor, ffDecimal, 2) & "GiB"
+  else:
+    result.text = intToStr(usedMem div mibDivisor) & "MiB"
 
 
 proc getDE(): string =
@@ -850,8 +864,49 @@ proc coloursLine(): string =
     result.add activePalette.reset
 
 
+proc memoryLevelBar(memory: MemoryInfo; width = 10): string =
+  if not memory.known:
+    return ""
+
+  let filled = int(round(memory.percent / 100.0 * width.float))
+  let fillColor = if memory.percent >= 80.0: activePalette.maroon elif memory.percent >= 60.0: activePalette.yellow else: activePalette.green
+  let useGlyphBar = activeIconPackName == "nerd" and not disableColor
+  let fullCell = if useGlyphBar: "█" else: "="
+  let emptyCell = if useGlyphBar: "░" else: "-"
+  let openCap = if useGlyphBar: "" else: "["
+  let closeCap = if useGlyphBar: "" else: "]"
+
+  result.add openCap
+  if not disableColor and fillColor.len > 0:
+    result.add fillColor
+  for _ in 0 ..< filled:
+    result.add fullCell
+  if not disableColor and activePalette.reset.len > 0:
+    result.add activePalette.reset
+  for _ in filled ..< width:
+    result.add emptyCell
+  result.add closeCap & " "
+  result.add intToStr(int(round(memory.percent))) & "%"
+
+
+proc formatMemory(memory: MemoryInfo): string =
+  if not memory.known:
+    return memory.text
+  memoryLevelBar(memory) & " " & memory.text
+
+
+proc memoryInfoJson(memory: MemoryInfo): JsonNode =
+  result = newJObject()
+  result["known"] = %memory.known
+  result["used_kib"] = %memory.usedKiB
+  result["total_kib"] = %memory.totalKiB
+  result["percent"] = %memory.percent
+
+
 proc statLine(accent, iconValue, label, value: string): string =
-  fmt"{accent}{iconValue}  {activePalette.yellow}{activePalette.bold}{label}:{activePalette.reset}  {value}"
+  const labelWidth = 6
+  let valuePad = repeat(" ", max(2, labelWidth - label.len + 2))
+  fmt"{accent}{iconValue}  {activePalette.yellow}{activePalette.bold}{label}:{activePalette.reset}{valuePad}{value}"
 
 
 proc buildStatsEntries(statsCol: int; snapshot: SystemSnapshot; modules: seq[ModuleKind]): seq[StatEntry] =
@@ -872,7 +927,7 @@ proc buildStatsEntries(statsCol: int; snapshot: SystemSnapshot; modules: seq[Mod
     of mkUptime:
       line = statLine(activePalette.green, activeIcons.uptime, "Uptime", snapshot.uptime)
     of mkMemory:
-      line = statLine(activePalette.lavender, activeIcons.memory, "Memory", snapshot.memory)
+      line = statLine(activePalette.lavender, activeIcons.memory, "Memory", formatMemory(snapshot.memory))
     of mkColours:
       line = "       " & coloursLine()
 
@@ -1051,7 +1106,8 @@ proc outputJson(snapshot: SystemSnapshot; modules: seq[ModuleKind]; logoInfo: tu
   root["desktop"] = %snapshot.desktop
   root["shell"] = %snapshot.shell
   root["uptime"] = %snapshot.uptime
-  root["memory"] = %snapshot.memory
+  root["memory"] = %snapshot.memory.text
+  root["memory_info"] = memoryInfoJson(snapshot.memory)
   root["packages"] = packageSummaryJson(snapshot.packages)
   root["theme"] = %activeThemeName
   root["icon_pack"] = %activeIconPackName
