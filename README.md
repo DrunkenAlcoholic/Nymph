@@ -1,6 +1,6 @@
 # Nymph
 
-Nymph is a lightweight system summary tool (fetch utility) written in Nim, with optional Kitty graphics logos, theming, and JSON output.
+Nymph is a lightweight terminal system summary tool (fetch utility) written in Nim, with optional Kitty graphics logos, theming, and JSON output.
 
 ## Screenshot
 
